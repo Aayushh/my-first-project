@@ -1,0 +1,51 @@
+---
+title: "My Amazing Research Paper"
+author: "Your Name"
+date: today
+format:
+  pdf:
+    documentclass: article
+    keep-tex: true # Good for debugging
+  docx: default # This allows you to render to Word too!
+bibliography: references.bib # Tells Quarto where your citations are
+---
+
+# Introduction
+
+This is the introduction to my paper. Here is my first citation [@Angrist1991].
+
+## Methods
+
+We use a very clever method to analyze our data.
+
+# Results
+
+Our results are groundbreaking. As seen in Figure 1, the effect is clear.
+
+```{python}
+#| label: fig-myplot
+#| fig-cap: "This is the caption for my amazing plot."
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# This is a placeholder plot.
+# In reality, you would load your processed data here.
+x = np.linspace(0, 10, 100)
+y = np.sin(x)
+
+plt.plot(x, y)
+plt.title("Sine Wave")
+plt.xlabel("X-axis")
+plt.ylabel("Y-axis")
+plt.show()
+
+#| label: tbl-mytable
+#| tbl-cap: "Summary statistics of the mtcars dataset."
+#| results: asis # This outputs the raw LaTeX code for the table
+
+# This is a placeholder using R's built-in data.
+# In reality, you would load your model results.
+# The 'modelsummary' package is excellent for this.
+library(modelsummary)
+datasummary_skim(mtcars)

@@ -1,0 +1,31 @@
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- R ---
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# --- Project-Specific ---
+# Ignore ALL data and output files. This is not optional.
+data/
+outputs/
+
+# Ignore environment files with secrets
+.env
+
+# --- LaTeX / Quarto Build Files ---
+# This section ignores all generated PDF, log, aux files, etc.
+# It is designed to ONLY track the source .qmd and .bib files.
+paper/*.pdf
+paper/*.log
+paper/*.aux
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/*.tex
+
+# --- VSCode ---
+.vscode/
