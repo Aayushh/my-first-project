@@ -59,9 +59,11 @@ def load_your_data(file_path, cache_path, force_rebuild=False):
     
     # Parse column names (format: Variable_Month_Year)
     print(f"  → Parsing column names (format: Variable_Month_Year)...")
-    df_long['Variable'] = df_long['Metric'].str.split('_').str[0].str.lower().str.strip()
-    df_long['Month'] = df_long['Metric'].str.split('_').str[1].str.strip()
-    df_long['Year'] = df_long['Metric'].str.split('_').str[2]
+    split_cols = df_long['Metric'].str.split('_')
+    df_long['Year'] = split_cols.str[-1]
+    df_long['Month'] = split_cols.str[-2]
+    df_long['Variable'] = split_cols.str[:-2].str.join('_').str.lower().str.strip()
+
     
     # Clean and standardize
     print(f"  → Standardizing fields...")
@@ -157,9 +159,9 @@ def load_official_data(file_path):
     
     # Map sheet names to variable names
     var_map = {
-        'Customs Value': 'value',
-        'Calculated Duties': 'duties',
-        'First Unit of Quantity': 'quantity'
+        'Customs Value': 'customs',
+        'Calculated Duties': 'calculated',
+        'First Unit of Quantity': 'quantity_value'
     }
     df_long['Variable'] = df_long['Source_Sheet'].map(var_map).fillna('unknown').str.lower().str.strip()
     

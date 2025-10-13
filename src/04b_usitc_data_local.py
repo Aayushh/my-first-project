@@ -18,8 +18,7 @@ VARIABLES = [
 ]
 ANCHOR_COLUMN = 'HTS Number'
 
-# --- NEW: Validation Configuration ---
-# Set the expected date range for your files. The script will error if any are missing.
+# --- Validation Configuration ---
 EXPECTED_START_DATE = '2024-01-01'
 EXPECTED_END_DATE = '2025-07-01'
 
@@ -66,13 +65,66 @@ def validate_monthly_files(file_paths: list, folder_name: str):
     
     print(f"      -> Validation successful for '{folder_name}'.")
 
+# --- NEW: Helper function for the "Non-Zero First" logic ---
+def resolve_quantity_conflicts(group, value_col_name):
+    """
+    Applies the "Non-Zero First, Unit Priority Second" logic to a group of conflicting rows.
+    """
+    # If there's only one row, no conflict to resolve.
+    if len(group) == 1:
+        return group
+
+    # Step 1: Separate non-zero rows from zero rows
+    non_zero_rows = group[group[value_col_name] > 0]
+    
+    pool_to_search = non_zero_rows
+    if non_zero_rows.empty:
+        # Fallback: if all values are zero, use the original group
+        pool_to_search = group
+
+    # Step 2: Apply unit priority to the selected pool of rows
+    chosen_row = None
+    
+    # Priority 1: 'number'
+    number_row = pool_to_search[pool_to_search['Quantity Description'] == 'number']
+    if not number_row.empty:
+        chosen_row = number_row.iloc[0:1]
+    
+    # Priority 2: 'kilograms'
+    if chosen_row is None:
+        kg_row = pool_to_search[pool_to_search['Quantity Description'] == 'kilograms']
+        if not kg_row.empty:
+            chosen_row = kg_row.iloc[0:1]
+    
+    # Priority 3 (Fallback): First available row in the pool
+    if chosen_row is None:
+        chosen_row = pool_to_search.iloc[0:1]
+
+    # --- Logging the decision ---
+    discarded_rows = group.drop(chosen_row.index)
+    
+    # Safely get values for logging
+    country = chosen_row['Country'].iloc[0]
+    hts_number = chosen_row['HTS Number'].iloc[0]
+    chosen_unit = chosen_row['Quantity Description'].iloc[0]
+    chosen_value = chosen_row[value_col_name].iloc[0]
+    
+    discarded_info = [f"'{row['Quantity Description']}' ({row[value_col_name]})" for _, row in discarded_rows.iterrows()]
+    
+    print(
+        f"      [Conflict Resolved] HTS: {hts_number} | Country: {country} -> "
+        f"Chose '{chosen_unit}' ({chosen_value}) over [{', '.join(discarded_info)}]"
+    )
+    
+    return chosen_row
+
 def process_single_file(file_path: str) -> pd.DataFrame:
     """
-    Reads metadata from Sheet 1 to decide which columns to load from Sheet 2,
-    making the process more memory-efficient and faster.
+    Reads a single Excel file. For 'quantity' files, it applies the new conflict
+    resolution logic. For all other files, it uses the original logic.
     """
     try:
-        # Step 1: Read Metadata
+        # --- Step 1: Read Metadata (Identical to original) ---
         meta_df = pd.read_excel(file_path, sheet_name=0, header=None, index_col=0, engine='calamine')
         metadata = meta_df[1].to_dict()
         
@@ -82,21 +134,20 @@ def process_single_file(file_path: str) -> pd.DataFrame:
         month_map = {1:'Jan', 2:'Feb', 3:'Mar', 4:'Apr', 5:'May', 6:'Jun', 7:'Jul', 8:'Aug', 9:'Sep', 10:'Oct', 11:'Nov', 12:'Dec'}
         month_name = month_map.get(month_num, 'Unk')
         
-        # Step 2: Selectively Load Data
-        columns_to_skip = None
-        clean_variable_name = variable_name.split(' ')[-1]
+        # --- MODIFIED: More robust variable name cleaning ---
+        # This now correctly handles all variables
+        is_quantity_file = 'quantity' in variable_name.lower()
+        if is_quantity_file:
+            clean_variable_name = 'quantity'
+        else:
+            # Use the first word for other variables (e.g., 'Customs' or 'Calculated')
+            clean_variable_name = variable_name.split(' ')[0]
 
-        if 'quantity' in clean_variable_name.lower():
-            columns_to_skip = [4] # Skip column E
-
-        df = pd.read_excel(
-            file_path, sheet_name=1, header=None, engine='calamine',
-            usecols=lambda x: x not in columns_to_skip if columns_to_skip else True
-        )
+        # --- Step 2: Load Data and Find Header (Identical to original) ---
+        df = pd.read_excel(file_path, sheet_name=1, header=None, engine='calamine')
         
-        # Step 3: Find Header and Clean
         header_row_index = -1
-        for i, row in df.head().iterrows():
+        for i, row in df.head(10).iterrows(): # Scan more rows for safety
             if any(ANCHOR_COLUMN in str(cell).strip() for cell in row.values):
                 header_row_index = i
                 break
@@ -106,49 +157,84 @@ def process_single_file(file_path: str) -> pd.DataFrame:
 
         df.columns = df.iloc[header_row_index]
         df = df.drop(range(header_row_index + 1)).reset_index(drop=True)
-        df.columns = df.columns.str.strip()
+        df.columns = [str(col).strip() for col in df.columns]
 
-        # Step 4: Rename Value Column
-        new_col_name = f"{clean_variable_name}_{month_name}_{year}"
+        # --- REFACTORED LOGIC ---
+        if is_quantity_file:
+            # --- Step 3a: Process QUANTITY files with new logic ---
+            value_col_name = next((col for col in df.columns if '_to_' in str(col)), df.columns[-1])
+            df.rename(columns={'Quantity Description': 'Quantity Description'}, inplace=True)
+            
+            # Ensure value column is numeric for comparison
+            df[value_col_name] = pd.to_numeric(df[value_col_name], errors='coerce').fillna(0)
 
-        if 'quantity' in clean_variable_name.lower():
-            suppressed_cols = [col for col in df.columns if str(col).endswith('_Suppressed')]
-            df = df.drop(columns=suppressed_cols, errors='ignore')
-            value_col_name = next((col for col in df.columns if '_to_' in str(col)), None)
-            if value_col_name:
-                df = df.rename(columns={value_col_name: new_col_name})
+            # Identify groups with multiple different units
+            unit_counts = df.groupby(KEY_COLUMNS)['Quantity Description'].nunique()
+            conflict_groups_index = unit_counts[unit_counts > 1].index
+            
+            is_conflict = df.set_index(KEY_COLUMNS).index.isin(conflict_groups_index)
+            df_conflicts = df[is_conflict].copy()
+            df_no_conflicts = df[~is_conflict].copy()
+
+            df_resolved = pd.DataFrame()
+            if not df_conflicts.empty:
+                df_resolved = df_conflicts.groupby(KEY_COLUMNS, as_index=False).apply(
+                    resolve_quantity_conflicts, value_col_name=value_col_name
+                ).reset_index(drop=True)
+            
+            df_final_monthly = pd.concat([df_no_conflicts, df_resolved], ignore_index=True)
+
+            # Create new _Value and _Unit columns
+            value_col_final_name = f"{clean_variable_name}_Value_{month_name}_{year}"
+            unit_col_final_name = f"{clean_variable_name}_Unit_{month_name}_{year}"
+            
+            df_final_monthly = df_final_monthly.rename(columns={value_col_name: value_col_final_name})
+            df_final_monthly[unit_col_final_name] = df_final_monthly['Quantity Description']
+            
+            columns_to_keep = KEY_COLUMNS + [value_col_final_name, unit_col_final_name]
+            return df_final_monthly[[col for col in columns_to_keep if col in df_final_monthly.columns]]
+        
         else:
+            # --- Step 3b: Process ALL OTHER files using original logic ---
+            # This block is now identical in function to your original script
+            new_col_name = f"{clean_variable_name}_{month_name}_{year}"
             month_col_name = df.columns[-1]
             df = df.rename(columns={month_col_name: new_col_name})
-        
-        # Step 5: Final Cleanup
-        columns_to_keep = KEY_COLUMNS + [new_col_name]
-        df = df[[col for col in columns_to_keep if col in df.columns]]
-        
-        return df
+            
+            columns_to_keep = KEY_COLUMNS + [new_col_name]
+            return df[[col for col in columns_to_keep if col in df.columns]]
+
     except Exception as e:
-        print(f"  -> Critical Error processing {os.path.basename(file_path)}: {e}")
+        print(f"      -> Critical Error processing {os.path.basename(file_path)}: {e}")
         return pd.DataFrame()
 
 def generate_summary_file(df: pd.DataFrame, output_path: str):
     """
-    Creates a summary report with country totals for each variable and month.
+    Creates a summary report. MODIFIED to be compatible with new quantity columns.
     """
     print("\n--- Generating Country Summary Report ---")
-    # Melt the wide DataFrame into a long format
-    long_df = pd.melt(df, id_vars=KEY_COLUMNS, var_name='Metric', value_name='Value')
     
-    # Extract Variable, Month, and Year from the 'Metric' column
-    # Example: 'Value_Jan_2024' -> 'Value', 'Jan', '2024'
-    long_df[['Variable', 'Month', 'Year']] = long_df['Metric'].str.extract(r'(\w+)_(\w+)_(\d{4})')
+    # --- MODIFIED: Select only numeric value columns for melting ---
+    value_cols = [col for col in df.columns if any(v in col for v in ['Customs_', 'Calculated_', '_Value_'])]
+    if not value_cols:
+        print("WARNING: No numeric value columns found to generate a summary. Skipping report.")
+        return
+        
+    long_df = pd.melt(df, id_vars=KEY_COLUMNS, value_vars=value_cols, var_name='Metric', value_name='Value')
     
-    # Group by Country, Variable, Year, and Month to get totals
+    long_df['Value'] = pd.to_numeric(long_df['Value'], errors='coerce').fillna(0)
+    
+    # --- MODIFIED: Regex now handles both 'Customs_Jan_2024' and 'quantity_Value_Jan_2024' ---
+    long_df[['Variable', 'Month', 'Year']] = long_df['Metric'].str.extract(r'(\w+?)(?:_Value)?_(\w+)_(\d{4})')
+    
     summary = long_df.groupby(['Country', 'Variable', 'Year', 'Month'])['Value'].sum().reset_index()
     
-    # Save to an Excel file with a separate sheet for each variable
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         for var_name, data in summary.groupby('Variable'):
-            data.pivot_table(index=['Country', 'Year'], columns='Month', values='Value').to_excel(writer, sheet_name=var_name)
+            month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            pivot_data = data.pivot_table(index=['Country', 'Year'], columns='Month', values='Value')
+            pivot_data = pivot_data.reindex(columns=[m for m in month_order if m in pivot_data.columns])
+            pivot_data.to_excel(writer, sheet_name=var_name)
     
     print(f"✅ Country summary report saved to: {output_path}")
 
@@ -165,29 +251,28 @@ if __name__ == "__main__":
         for sort_order in ['ascending', 'descending']:
             folder_path = os.path.join(BASE_PATH, f'{var} {sort_order}')
             if not os.path.isdir(folder_path): 
-                print(f"\n  -> INFO: Folder not found, skipping: {folder_path}")
+                print(f"\n   -> INFO: Folder not found, skipping: {folder_path}")
                 continue
 
             monthly_files = glob.glob(os.path.join(folder_path, '*.xlsx'))
             if not monthly_files: 
-                print(f"\n  -> INFO: No Excel files found in folder: {folder_path}")
+                print(f"\n   -> INFO: No Excel files found in folder: {folder_path}")
                 continue
             
-            # --- NEW: Perform validation before processing ---
             try:
                 validate_monthly_files(monthly_files, f"{var} {sort_order}")
             except ValueError as e:
                 print(f"\n❌ {e}")
-                exit() # Stop the script if validation fails
+                exit()
 
             with Pool(processes=max(1, cpu_count() - 1)) as pool:
-                print(f"\n  -> Reading {len(monthly_files)} files from '{sort_order}' folder in parallel...")
+                print(f"\n   -> Reading {len(monthly_files)} files from '{sort_order}' folder in parallel...")
                 list_of_monthly_dfs = pool.map(process_single_file, monthly_files)
 
             list_of_monthly_dfs = [df for df in list_of_monthly_dfs if not df.empty]
             
             if not list_of_monthly_dfs:
-                print(f"  -> WARNING: No valid data could be extracted from any file in the '{sort_order}' folder.")
+                print(f"   -> WARNING: No valid data could be extracted from any file in the '{sort_order}' folder.")
                 continue
 
             if list_of_monthly_dfs:
@@ -195,9 +280,9 @@ if __name__ == "__main__":
                 show_df_preview(merged_months_df, f"1. Merged Months for '{var} {sort_order}'")
                 sort_order_dfs.append(merged_months_df)
         
-        print(f"\n  -> Found {len(sort_order_dfs)} DataFrame(s) to consolidate for '{var}'.")
+    
         if len(sort_order_dfs) > 0:
-            print(f"  -> Consolidating ascending/descending data for {var}...")
+            print(f"\n   -> Consolidating ascending/descending data for {var}...")
             stacked_df = pd.concat(sort_order_dfs, ignore_index=True)
             consolidated_df = stacked_df.groupby(KEY_COLUMNS, as_index=False).first()
             show_df_preview(consolidated_df, f"2. Consolidated Data for '{var}'")
@@ -209,12 +294,13 @@ if __name__ == "__main__":
     dataframes_to_merge = list(final_variable_dfs.values())
 
     if len(dataframes_to_merge) > 1:
-        final_df = dataframes_to_merge[0]
-        for i in range(1, len(dataframes_to_merge)):
-            right_df = dataframes_to_merge[i]
-            final_df = pd.merge(final_df, right_df, on=KEY_COLUMNS, how='outer')
-
-        final_df = final_df.fillna(0).drop_duplicates()
+        final_df = reduce(lambda left, right: pd.merge(left, right, on=KEY_COLUMNS, how='outer'), dataframes_to_merge)
+        
+        # --- MODIFIED: Safely fill NaNs only in numeric columns ---
+        numeric_cols = final_df.select_dtypes(include='number').columns
+        final_df[numeric_cols] = final_df[numeric_cols].fillna(0)
+        
+        final_df = final_df.drop_duplicates()
 
         show_df_preview(final_df, "3. Final Merged DataFrame")
         print("\nFinal Column List (Sorted):")
@@ -223,42 +309,24 @@ if __name__ == "__main__":
         print("\n\n--- Saving final files ---")
         print("This may take a few moments for large files...")
         try:
-            # --- Generate the summary file ---
             summary_output_path = os.path.join(BASE_PATH, 'country_summary_report.xlsx')
             generate_summary_file(final_df, summary_output_path)
             
-            # --- Saving to Parquet (fastest, for future analysis) ---
             output_path_parquet = os.path.join(BASE_PATH, 'master_trade_data_final.parquet')
             print(f"\n -> Writing to Parquet file: {output_path_parquet} (fastest)...")
             final_df.to_parquet(output_path_parquet, index=False)
             print(f"✅ Master data file saved to efficient Parquet format.")
             print("\nRECOMMENDATION: For your next analysis, load the '.parquet' file. It will be much faster.")
-
-            # --- Saving to Excel (slower, for human readability) ---
-            # Using the 'xlsxwriter' engine can be faster than the default.
-            # You may need to install it first: pip install xlsxwriter
+            
             output_path_xlsx = os.path.join(BASE_PATH, 'master_trade_data.xlsx')
             print(f"\n -> Writing to Excel file: {output_path_xlsx} (this is often the slowest step)...")
             final_df.to_excel(output_path_xlsx, index=False, engine='xlsxwriter')
             print(f"✅ Master data file saved to Excel.")
-
-            # --- Saving to CSV (faster alternative to Excel) ---
-            output_path_csv = os.path.join(BASE_PATH, 'master_trade_data.csv')
-            print(f"\n -> Writing to CSV file: {output_path_csv} (faster)...")
-            final_df.to_csv(output_path_csv, index=False)
-            print(f"✅ Master data file saved to CSV.")
-
-            # --- Saving to Parquet (fastest, for future analysis) ---
-            output_path_parquet = os.path.join(BASE_PATH, 'master_trade_data_final.parquet')
-            print(f"\n -> Writing to Parquet file: {output_path_parquet} (fastest)...")
-            final_df.to_parquet(output_path_parquet, index=False)
-            print(f"✅ Master data file saved to efficient Parquet format.")
-            print("\nRECOMMENDATION: For your next analysis, load the '.parquet' file. It will be much faster.")
+            
 
         except PermissionError:
             print("\n❌ ERROR: Could not save a file. Please ensure it is not open elsewhere and try again.")
         except ImportError:
-            print("\n❌ ERROR: The 'xlsxwriter' engine is not installed. Please run: pip install xlsxwriter")
+            print("\n❌ ERROR: The 'xlsxwriter' or 'openpyxl' engine is not installed. Please install it.")
     else:
         print("Processing complete, but less than two variables had data to merge.")
-
